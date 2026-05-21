@@ -1,0 +1,22 @@
+[package]
+name = "collie"
+version = "2.0.0"
+edition = "2021"
+description = "BorderCollie CLI — submit local diffs for AI review from any terminal or CI"
+license = "Apache-2.0"
+repository = "https://github.com/woofcloud/border-collie"
+
+[[bin]]
+name = "collie"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+toml = "0.8"
+anyhow = "1"
+dirs = "5"
+colored = "2"

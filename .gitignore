@@ -1,0 +1,7 @@
+/target
+# bc is a binary crate — commit Cargo.lock for reproducible release builds
+# (cli-release.yml uses `cargo build --locked` which requires it)
+.DS_Store
+*.iml
+.idea
+*.log

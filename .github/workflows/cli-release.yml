@@ -1,0 +1,152 @@
+name: cli-release
+
+# 触发：推 `cli-v*` tag（如 cli-v2.0.0）
+# 产出：5 个矩阵的 `collie-<target>.{tar.gz,zip}` + `.sha256`，挂到一个 GitHub Release。
+# install.sh（部署在 review.woofcloud.com）会按 OS/arch 拉对应的 artifact。
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            archive: zip
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compiler (linux aarch64)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Cargo build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        id: stage
+        run: |
+          name="collie-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            cp "target/${{ matrix.target }}/release/collie.exe" "dist/$name/collie.exe"
+          else
+            cp "target/${{ matrix.target }}/release/collie" "dist/$name/collie"
+            chmod +x "dist/$name/collie"
+          fi
+          cp README.md "dist/$name/README.md" 2>/dev/null || true
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Archive
+        working-directory: dist
+        run: |
+          name="${{ steps.stage.outputs.name }}"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            if command -v 7z >/dev/null; then 7z a "${name}.zip" "$name" >/dev/null
+            else (cd "$name" && zip -qr "../${name}.zip" .)
+            fi
+            sha=$(sha256sum "${name}.zip" 2>/dev/null || shasum -a 256 "${name}.zip")
+            echo "$sha" > "${name}.zip.sha256"
+          else
+            tar -czf "${name}.tar.gz" "$name"
+            sha=$(sha256sum "${name}.tar.gz" 2>/dev/null || shasum -a 256 "${name}.tar.gz")
+            echo "$sha" > "${name}.tar.gz.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collie-${{ matrix.target }}
+          path: dist/collie-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: create release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          set -e
+          tag="${GITHUB_REF#refs/tags/}"
+          prev="$(git tag --list 'cli-v*' --sort=-v:refname | sed -n 2p)"
+          if [[ -n "$prev" ]]; then
+            range="${prev}..${tag}"
+          else
+            range="$tag"
+          fi
+          {
+            echo "## ${tag}"
+            echo
+            echo "### Highlights"
+            git log "$range" --pretty=format:'- %s' | grep -E '^- (feat|fix|refactor)\(' || echo "- routine update"
+            echo
+            echo "### Install"
+            echo '```'
+            echo "curl -fsSL https://review.woofcloud.com/install.sh | sh"
+            echo '```'
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/collie-*.tar.gz
+            dist/collie-*.tar.gz.sha256
+            dist/collie-*.zip
+            dist/collie-*.zip.sha256
