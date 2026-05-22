@@ -118,7 +118,7 @@ curl -fsSL https://review.woofcloud.com/install.sh | sh
 |---|---|---|
 | `BC_INSTALL_DIR` | `~/.local/bin` | 安装目录 |
 | `BC_VERSION` | (latest) | 指定历史版本，例如 `cli-v2.0.0` |
-| `BC_RELEASE_REPO` | `woofcloud/border-collie` | release 源仓（fork 自托管用） |
+| `BC_RELEASE_REPO` | `woofcloud/border-collie-cli` | release 源仓（fork 自托管用） |
 
 ### Windows
 

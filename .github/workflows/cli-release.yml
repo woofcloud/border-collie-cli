@@ -9,6 +9,11 @@ on:
     tags:
       - 'cli-v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. cli-v2.0.1'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -41,7 +46,26 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Resolve release tag
+        id: release-meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$tag" in
+            cli-v*) ;;
+            *)
+              echo "::error::Release tag must match cli-v*, got: $tag"
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release-meta.outputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -101,9 +125,27 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
+      - name: Resolve release tag
+        id: release-meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          case "$tag" in
+            cli-v*) ;;
+            *)
+              echo "::error::Release tag must match cli-v*, got: $tag"
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ steps.release-meta.outputs.tag }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -118,7 +160,7 @@ jobs:
         id: notes
         run: |
           set -e
-          tag="${GITHUB_REF#refs/tags/}"
+          tag="${{ steps.release-meta.outputs.tag }}"
           prev="$(git tag --list 'cli-v*' --sort=-v:refname | sed -n 2p)"
           if [[ -n "$prev" ]]; then
             range="${prev}..${tag}"
@@ -141,8 +183,8 @@ jobs:
       - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.release-meta.outputs.tag }}
+          name: ${{ steps.release-meta.outputs.tag }}
           body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true
           files: |
