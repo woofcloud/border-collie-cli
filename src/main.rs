@@ -14,7 +14,7 @@
 //! 所有命令统一走 `/api/v1/cli/**`（X-API-Key 鉴权）。
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use colored::Colorize;
 use reqwest::blocking::{Client, RequestBuilder};
@@ -31,18 +31,51 @@ use std::{
 
 const DEFAULT_API: &str = "https://review.woofcloud.com";
 /// GitHub Release 仓库；可由 BC_RELEASE_REPO env 覆盖，便于 fork 自托管。
-const DEFAULT_RELEASE_REPO: &str = "woofcloud/border-collie";
+const DEFAULT_RELEASE_REPO: &str = "woofcloud/border-collie-cli";
 /// 默认 install.sh 来源；最终回落到这里。
 const DEFAULT_INSTALL_SH: &str = "https://review.woofcloud.com/install.sh";
 const POLL_INTERVAL_SECS: u64 = 3;
 const POLL_MAX_ATTEMPTS: u32 = 60;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_accepts_markdown_output_options() {
+        let cli = Cli::try_parse_from(["collie", "review", "--format", "md", "--out", "review.md"])
+            .expect("review output options should parse");
+
+        match cli.cmd {
+            Cmd::Review { .. } => {}
+            _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
+    fn default_release_repo_points_to_split_cli_repo() {
+        assert_eq!(DEFAULT_RELEASE_REPO, "woofcloud/border-collie-cli");
+    }
+
+    #[test]
+    fn cli_page_path_uses_current_and_size() {
+        assert_eq!(
+            page_path("/api/v1/cli/logs/page", 2, 5, &[]),
+            "/api/v1/cli/logs/page?current=2&size=5"
+        );
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // CLI 定义
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "collie", version, about = "BorderCollie — AI code reviewer CLI")]
+#[command(
+    name = "collie",
+    version,
+    about = "BorderCollie — AI code reviewer CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -110,6 +143,12 @@ enum Cmd {
         no_wait: bool,
         #[arg(long, conflicts_with_all = ["base", "head"])]
         diff_from_stdin: bool,
+        /// 输出格式：text / md / json
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// 将最终报告写入文件（CI 常用）
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// 让后端去拉 base..branch 直接跑审查（依赖 repo 已配 access_token）
     #[command(name = "review-branch")]
@@ -177,6 +216,13 @@ enum Cmd {
     },
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Md,
+    Json,
+}
+
 #[derive(Subcommand)]
 enum RepoCmd {
     /// 列当前租户的仓库
@@ -224,11 +270,17 @@ enum ModelCmd {
         #[arg(long, default_value_t = 0.7)]
         temperature: f64,
     },
-    Rm { id: i64 },
+    Rm {
+        id: i64,
+    },
     /// 设为默认模型
-    Use { id: i64 },
+    Use {
+        id: i64,
+    },
     /// 看单个模型详情
-    Show { id: i64 },
+    Show {
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,8 +309,12 @@ enum AgentCmd {
         #[arg(long, default_value_t = 100)]
         weight: i32,
     },
-    Rm { id: i64 },
-    Toggle { id: i64 },
+    Rm {
+        id: i64,
+    },
+    Toggle {
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -282,7 +338,9 @@ enum ReviewerCmd {
         #[arg(long)]
         model_id: Option<i64>,
     },
-    Rm { id: i64 },
+    Rm {
+        id: i64,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -311,8 +369,8 @@ fn load_profile() -> Result<Profile> {
             path.display()
         );
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("读取配置失败: {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("读取配置失败: {}", path.display()))?;
     let mut p: Profile = toml::from_str(&raw).context("配置文件不是合法 TOML")?;
     if p.api.is_empty() {
         p.api = DEFAULT_API.to_string();
@@ -364,7 +422,9 @@ struct Envelope<T> {
 
 fn req(profile: &Profile, method: Method, path: &str) -> RequestBuilder {
     let url = format!("{}{}", profile.api, path);
-    client().request(method, &url).header("X-API-Key", &profile.key)
+    client()
+        .request(method, &url)
+        .header("X-API-Key", &profile.key)
 }
 
 fn call_json<T: serde::de::DeserializeOwned>(rb: RequestBuilder) -> Result<T> {
@@ -375,12 +435,16 @@ fn call_json<T: serde::de::DeserializeOwned>(rb: RequestBuilder) -> Result<T> {
         bail!("HTTP {}: {}", status.as_u16(), body);
     }
     let env: Envelope<T> =
-        serde_json::from_str(&body).with_context(|| format!("响应不是合法 JSON: {}", body))?;
+        serde_json::from_str(&body).with_context(|| format!("响应不是合法 JSON: {body}"))?;
     if env.code != 10000000 {
-        bail!("接口失败 code={}: {}", env.code, env.msg.unwrap_or_default());
+        bail!(
+            "接口失败 code={}: {}",
+            env.code,
+            env.msg.unwrap_or_default()
+        );
     }
     env.data
-        .ok_or_else(|| anyhow!("响应缺少 data 字段：{}", body))
+        .ok_or_else(|| anyhow!("响应缺少 data 字段：{body}"))
 }
 
 fn call_unit(rb: RequestBuilder) -> Result<()> {
@@ -391,9 +455,13 @@ fn call_unit(rb: RequestBuilder) -> Result<()> {
         bail!("HTTP {}: {}", status.as_u16(), body);
     }
     let env: Envelope<Value> =
-        serde_json::from_str(&body).with_context(|| format!("响应不是合法 JSON: {}", body))?;
+        serde_json::from_str(&body).with_context(|| format!("响应不是合法 JSON: {body}"))?;
     if env.code != 10000000 {
-        bail!("接口失败 code={}: {}", env.code, env.msg.unwrap_or_default());
+        bail!(
+            "接口失败 code={}: {}",
+            env.code,
+            env.msg.unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -422,12 +490,24 @@ fn run_git(args: &[&str]) -> Result<String> {
 /// 1. 当前分支的 upstream（@{upstream}）
 /// 2. 远端 origin 上实存的第一个 main / master / develop
 fn infer_base() -> Option<String> {
-    if let Ok(up) = run_git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]) {
+    if let Ok(up) = run_git(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ]) {
         if !up.is_empty() {
             return Some(up);
         }
     }
-    for cand in ["origin/main", "origin/master", "origin/develop", "main", "master", "develop"] {
+    for cand in [
+        "origin/main",
+        "origin/master",
+        "origin/develop",
+        "main",
+        "master",
+        "develop",
+    ] {
         if run_git(&["rev-parse", "--verify", "--quiet", cand]).is_ok() {
             return Some(cand.to_string());
         }
@@ -455,7 +535,7 @@ fn infer_repo_name() -> String {
             let name = segments.pop().unwrap_or("");
             let owner = segments.pop().unwrap_or("");
             if !owner.is_empty() && !name.is_empty() {
-                return format!("{}/{}", owner, name);
+                return format!("{owner}/{name}");
             }
         }
     }
@@ -668,13 +748,13 @@ fn print_status(s: &StatusData) {
         println!("  risk       : {}", risk_color(r));
     }
     if let Some(score) = s.score {
-        println!("  score      : {}", score);
+        println!("  score      : {score}");
     }
     if let Some(t) = &s.created_at {
-        println!("  created at : {}", t);
+        println!("  created at : {t}");
     }
     if let Some(t) = &s.completed_at {
-        println!("  finished at: {}", t);
+        println!("  finished at: {t}");
     }
     if let Some(err) = &s.error_msg {
         if !err.is_empty() {
@@ -702,16 +782,13 @@ fn cmd_login(api: Option<String>, non_interactive: bool, key: Option<String>) ->
 
     if non_interactive {
         let key = key.ok_or_else(|| anyhow!("--non-interactive 需要配合 --key"))?;
-        return save_profile(&Profile {
-            api: api_url,
-            key,
-        });
+        return save_profile(&Profile { api: api_url, key });
     }
 
     // 1. 申请 device_code + user_code
     let host = hostname_or_unknown();
     let body = serde_json::json!({ "clientMeta": format!("collie-cli {} on {}", env!("CARGO_PKG_VERSION"), host) });
-    let url = format!("{}/api/v1/cli/device/code", api_url);
+    let url = format!("{api_url}/api/v1/cli/device/code");
     let resp = client()
         .post(&url)
         .json(&body)
@@ -730,13 +807,14 @@ fn cmd_login(api: Option<String>, non_interactive: bool, key: Option<String>) ->
             env.msg.unwrap_or_default()
         );
     }
-    let dc = env
-        .data
-        .ok_or_else(|| anyhow!("响应缺少 data"))?;
+    let dc = env.data.ok_or_else(|| anyhow!("响应缺少 data"))?;
 
     // 2. 提示用户
     println!();
-    println!("{}", "▸ open the URL in your browser and confirm the code:".bold());
+    println!(
+        "{}",
+        "▸ open the URL in your browser and confirm the code:".bold()
+    );
     println!("    {}", dc.verification_uri.cyan());
     println!("    {} {}", "code:".dimmed(), dc.user_code.green().bold());
     println!();
@@ -750,7 +828,7 @@ fn cmd_login(api: Option<String>, non_interactive: bool, key: Option<String>) ->
     // 3. 轮询，直到 approved / expired / denied
     let interval = dc.interval.max(1) as u64;
     let max_attempts = ((dc.expires_in as u64) / interval).max(1);
-    let poll_url = format!("{}/api/v1/cli/device/poll", api_url);
+    let poll_url = format!("{api_url}/api/v1/cli/device/poll");
     let poll_body = serde_json::json!({ "deviceCode": dc.device_code });
     print!("  {} ", "waiting…".dimmed());
     use std::io::Write;
@@ -779,9 +857,9 @@ fn cmd_login(api: Option<String>, non_interactive: bool, key: Option<String>) ->
         };
         match p.status.as_str() {
             "approved" => {
-                let key = p
-                    .api_key
-                    .ok_or_else(|| anyhow!("approved 但 API key 缺失，服务端可能已清理；请重试 collie login"))?;
+                let key = p.api_key.ok_or_else(|| {
+                    anyhow!("approved 但 API key 缺失，服务端可能已清理；请重试 collie login")
+                })?;
                 println!();
                 save_profile(&Profile {
                     api: api_url.clone(),
@@ -847,7 +925,10 @@ fn cmd_repo_list() -> Result<()> {
         println!("{}", "(no repos)".dimmed());
         return Ok(());
     }
-    println!("{:>5}  {:<28}  {:<10}  {:<6}  {}", "ID", "REPO", "PLATFORM", "ON", "URL");
+    println!(
+        "{:>5}  {:<28}  {:<10}  {:<6}  URL",
+        "ID", "REPO", "PLATFORM", "ON"
+    );
     for r in list {
         println!(
             "{:>5}  {:<28}  {:<10}  {:<6}  {}",
@@ -887,14 +968,18 @@ fn cmd_repo_add(
 
 fn cmd_repo_rm(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/repo/{}", id)))?;
+    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/repo/{id}")))?;
     println!("{} repo #{} deleted", "✓".green(), id);
     Ok(())
 }
 
 fn cmd_repo_toggle(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::PUT, &format!("/api/v1/cli/repo/{}/toggle", id)))?;
+    call_unit(req(
+        &p,
+        Method::PUT,
+        &format!("/api/v1/cli/repo/{id}/toggle"),
+    ))?;
     println!("{} repo #{} toggled", "✓".green(), id);
     Ok(())
 }
@@ -907,8 +992,8 @@ fn cmd_model_list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:>5}  {:<24}  {:<14}  {:<7}  {:<6}  {}",
-        "ID", "NAME", "PROVIDER", "DEFAULT", "ON", "API"
+        "{:>5}  {:<24}  {:<14}  {:<7}  {:<6}  API",
+        "ID", "NAME", "PROVIDER", "DEFAULT", "ON"
     );
     for m in list {
         println!(
@@ -949,14 +1034,18 @@ fn cmd_model_add(
 
 fn cmd_model_rm(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/model/{}", id)))?;
+    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/model/{id}")))?;
     println!("{} model #{} deleted", "✓".green(), id);
     Ok(())
 }
 
 fn cmd_model_use(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::PUT, &format!("/api/v1/cli/model/{}/default", id)))?;
+    call_unit(req(
+        &p,
+        Method::PUT,
+        &format!("/api/v1/cli/model/{id}/default"),
+    ))?;
     println!("{} model #{} set as default", "✓".green(), id);
     Ok(())
 }
@@ -967,7 +1056,7 @@ fn cmd_model_show(id: i64) -> Result<()> {
     let m = list
         .into_iter()
         .find(|m| m.id == Some(id))
-        .ok_or_else(|| anyhow!("model {} 不存在", id))?;
+        .ok_or_else(|| anyhow!("model {id} 不存在"))?;
     println!("{}", "▸ model".bold());
     println!("  id       : {}", m.id.unwrap_or(0));
     println!("  name     : {}", m.model_name.as_deref().unwrap_or("-"));
@@ -986,7 +1075,10 @@ fn cmd_agent_list() -> Result<()> {
         println!("{}", "(no agents)".dimmed());
         return Ok(());
     }
-    println!("{:>5}  {:<28}  {:<14}  {:<5}  {}", "ID", "NAME", "ROLE", "ORDER", "ON");
+    println!(
+        "{:>5}  {:<28}  {:<14}  {:<5}  ON",
+        "ID", "NAME", "ROLE", "ORDER"
+    );
     for a in list {
         println!(
             "{:>5}  {:<28}  {:<14}  {:<5}  {}",
@@ -1028,14 +1120,18 @@ fn cmd_agent_add(
 
 fn cmd_agent_rm(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/agent/{}", id)))?;
+    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/agent/{id}")))?;
     println!("{} agent #{} deleted", "✓".green(), id);
     Ok(())
 }
 
 fn cmd_agent_toggle(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::PUT, &format!("/api/v1/cli/agent/{}/toggle", id)))?;
+    call_unit(req(
+        &p,
+        Method::PUT,
+        &format!("/api/v1/cli/agent/{id}/toggle"),
+    ))?;
     println!("{} agent #{} toggled", "✓".green(), id);
     Ok(())
 }
@@ -1048,8 +1144,8 @@ fn cmd_reviewer_list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:>5}  {:<28}  {:<14}  {:<7}  {:<6}  {}",
-        "ID", "NAME", "CATEGORY", "BUILTIN", "ON", "LANGUAGES"
+        "{:>5}  {:<28}  {:<14}  {:<7}  {:<6}  LANGUAGES",
+        "ID", "NAME", "CATEGORY", "BUILTIN", "ON"
     );
     for r in list {
         println!(
@@ -1090,7 +1186,11 @@ fn cmd_reviewer_add(
 
 fn cmd_reviewer_rm(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::DELETE, &format!("/api/v1/cli/reviewer/{}", id)))?;
+    call_unit(req(
+        &p,
+        Method::DELETE,
+        &format!("/api/v1/cli/reviewer/{id}"),
+    ))?;
     println!("{} reviewer #{} deleted", "✓".green(), id);
     Ok(())
 }
@@ -1099,7 +1199,7 @@ fn read_prompt(inline: Option<String>, file: Option<String>) -> Result<Option<St
     match (inline, file) {
         (Some(s), _) => Ok(Some(s)),
         (None, Some(path)) => Ok(Some(
-            fs::read_to_string(&path).with_context(|| format!("读取 {} 失败", path))?,
+            fs::read_to_string(&path).with_context(|| format!("读取 {path} 失败"))?,
         )),
         (None, None) => Ok(None),
     }
@@ -1182,19 +1282,36 @@ fn cmd_usage() -> Result<()> {
             Some(l) if l > 0 => {
                 let p = (cur as f64 / l as f64) * 100.0;
                 let bar = bar_of(p);
-                let line = format!("{:>10} / {:<10}  {}  {:>5.1}%", cur, l, bar, p);
-                if p >= 90.0 { line.red().to_string() }
-                else if p >= 70.0 { line.yellow().to_string() }
-                else { line }
+                let line = format!("{cur:>10} / {l:<10}  {bar}  {p:>5.1}%");
+                if p >= 90.0 {
+                    line.red().to_string()
+                } else if p >= 70.0 {
+                    line.yellow().to_string()
+                } else {
+                    line
+                }
             }
             _ => format!("{:>10} / {:<10}", cur, "∞"),
         }
     }
     println!("\n{}", "▸ usage".bold());
-    println!("  repos        {}", pct(u.current.repo_count, u.limits.max_repos));
-    println!("  reviews/day  {}", pct(u.current.today_reviews, u.limits.max_reviews_per_day));
-    println!("  reviews/mo   {}", pct(u.current.month_reviews, u.limits.max_reviews_per_month));
-    println!("  tokens/mo    {}", pct(u.current.month_tokens, u.limits.max_tokens_per_month));
+    println!(
+        "  repos        {}",
+        pct(u.current.repo_count, u.limits.max_repos)
+    );
+    println!(
+        "  reviews/day  {}",
+        pct(u.current.today_reviews, u.limits.max_reviews_per_day)
+    );
+    println!(
+        "  reviews/mo   {}",
+        pct(u.current.month_reviews, u.limits.max_reviews_per_month)
+    );
+    println!(
+        "  tokens/mo    {}",
+        pct(u.current.month_tokens, u.limits.max_tokens_per_month)
+    );
+    println!("  tokens/day   {:>10}", u.current.today_tokens);
     if let Some(seats) = u.limits.max_team_members {
         println!("  team seats   {:>10} / {:<10}", "?", seats);
     }
@@ -1219,22 +1336,36 @@ fn cmd_plans() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<14}  {:<14}  {:<10}  {:<10}  {:<12}  {}",
-        "NAME", "DISPLAY", "PRICE", "REPOS", "TOKENS/MO", "DESC"
+        "{:<14}  {:<14}  {:<18}  {:<10}  {:<10}  {:<12}  DESC",
+        "NAME", "DISPLAY", "PRICE", "REPOS", "REVIEWS/D", "TOKENS/MO"
     );
     for plan in list {
         let price = match plan.billing_period.as_deref() {
             Some("free") => "free".to_string(),
-            _ => format!("¥{:.0}/mo", plan.price_cny.unwrap_or(0.0)),
+            _ => match plan.price_usd {
+                Some(usd) => format!("¥{:.0}/mo (${usd:.0})", plan.price_cny.unwrap_or(0.0)),
+                None => format!("¥{:.0}/mo", plan.price_cny.unwrap_or(0.0)),
+            },
         };
-        let popular = if plan.is_popular == Some(1) { " ★".yellow().to_string() } else { "".to_string() };
+        let popular = if plan.is_popular == Some(1) {
+            " ★".yellow().to_string()
+        } else {
+            "".to_string()
+        };
         println!(
-            "{:<14}  {:<14}  {:<10}  {:<10}  {:<12}  {}{}",
+            "{:<14}  {:<14}  {:<18}  {:<10}  {:<10}  {:<12}  {}{}",
             plan.plan_name.as_deref().unwrap_or("-"),
             plan.plan_display.as_deref().unwrap_or("-"),
             price,
-            plan.max_repos.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-            plan.max_tokens_per_month.map(|v| format!("{}k", v / 1000)).unwrap_or_else(|| "-".to_string()),
+            plan.max_repos
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            plan.max_reviews_per_day
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            plan.max_tokens_per_month
+                .map(|v| format!("{}k", v / 1000))
+                .unwrap_or_else(|| "-".to_string()),
             plan.description.as_deref().unwrap_or("").dimmed(),
             popular,
         );
@@ -1244,27 +1375,26 @@ fn cmd_plans() -> Result<()> {
 
 fn cmd_logs(task_id: Option<i64>, page: u64, size: u64, status: Option<String>) -> Result<()> {
     let p = load_profile()?;
-    let mut path = format!("/api/v1/cli/logs/page?current={}&size={}", page, size);
+    let mut filters: Vec<(&str, String)> = Vec::new();
     if let Some(t) = task_id {
-        use std::fmt::Write;
-        let _ = write!(path, "&taskId={}", t);
+        filters.push(("taskId", t.to_string()));
     }
     if let Some(s) = status {
-        use std::fmt::Write;
-        let _ = write!(path, "&status={}", urlencoding::encode(&s));
+        filters.push(("status", s));
     }
+    let path = page_path("/api/v1/cli/logs/page", page, size, &filters);
     let data: Page<ModelLogRow> = call_json(req(&p, Method::GET, &path))?;
     if data.records.is_empty() {
         println!("{}", "(no model logs)".dimmed());
         return Ok(());
     }
     println!(
-        "{:>6}  {:>7}  {:<18}  {:<10}  {:>6}  {:>6}  {:>7}  {:<8}  {}",
-        "ID", "TASK", "MODEL", "PROVIDER", "PROMPT", "COMPL", "TOTAL", "STATUS", "WHEN"
+        "{:>6}  {:>7}  {:<18}  {:<10}  {:>6}  {:>6}  {:>7}  {:>7}  {:<8}  WHEN",
+        "ID", "TASK", "MODEL", "PROVIDER", "PROMPT", "COMPL", "TOTAL", "MS", "STATUS"
     );
     for row in data.records {
         println!(
-            "{:>6}  {:>7}  {:<18}  {:<10}  {:>6}  {:>6}  {:>7}  {:<8}  {}",
+            "{:>6}  {:>7}  {:<18}  {:<10}  {:>6}  {:>6}  {:>7}  {:>7}  {:<8}  {}",
             row.id.unwrap_or(0),
             row.task_id.unwrap_or(0),
             row.model_name.as_deref().unwrap_or("-"),
@@ -1272,6 +1402,7 @@ fn cmd_logs(task_id: Option<i64>, page: u64, size: u64, status: Option<String>) 
             row.prompt_tokens.unwrap_or(0),
             row.completion_tokens.unwrap_or(0),
             row.total_tokens.unwrap_or(0),
+            row.duration_ms.unwrap_or(0),
             status_color(row.status.as_deref().unwrap_or("-")),
             row.created_at.as_deref().unwrap_or("-").dimmed(),
         );
@@ -1315,7 +1446,7 @@ fn cmd_config() -> Result<()> {
         } else {
             line.to_string()
         };
-        println!("  {}", mask);
+        println!("  {mask}");
     }
     Ok(())
 }
@@ -1335,14 +1466,14 @@ struct GhRelease {
 fn cmd_upgrade(check: bool, run: bool, install_url: Option<String>) -> Result<()> {
     let _ = check; // 显式 --check 与默认行为一致，只用作可读性
     let current = env!("CARGO_PKG_VERSION");
-    let repo = std::env::var("BC_RELEASE_REPO")
-        .unwrap_or_else(|_| DEFAULT_RELEASE_REPO.to_string());
+    let repo =
+        std::env::var("BC_RELEASE_REPO").unwrap_or_else(|_| DEFAULT_RELEASE_REPO.to_string());
 
     println!("{} {}", "▸ current".bold(), current.cyan());
     println!("  {} {}", "release repo".dimmed(), repo);
 
     // GitHub API 不需要 X-API-Key，单独构造一次性 client
-    let api = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    let api = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = client()
         .get(&api)
         .header("Accept", "application/vnd.github+json")
@@ -1375,7 +1506,7 @@ fn cmd_upgrade(check: bool, run: bool, install_url: Option<String>) -> Result<()
         println!(
             "\n{} {}\n",
             "✓ 有新版本可升级。".green(),
-            format!("v{}", latest_num).bold()
+            format!("v{latest_num}").bold()
         );
         let url = install_url
             .or_else(|| std::env::var("BC_INSTALL_URL").ok())
@@ -1385,7 +1516,7 @@ fn cmd_upgrade(check: bool, run: bool, install_url: Option<String>) -> Result<()
             println!("{} {}", "▸ running".bold(), &url);
             let status = Command::new("sh")
                 .arg("-c")
-                .arg(format!("curl -fsSL '{}' | sh", url))
+                .arg(format!("curl -fsSL '{url}' | sh"))
                 .status()
                 .context("无法启动 sh，尝试手动运行：curl -fsSL ... | sh")?;
             if !status.success() {
@@ -1393,8 +1524,12 @@ fn cmd_upgrade(check: bool, run: bool, install_url: Option<String>) -> Result<()
             }
         } else {
             println!("{}", "  一键升级：".bold());
-            println!("    curl -fsSL {} | sh", url);
-            println!("  {}", "或：collie upgrade --run（脚本会探测 OS/arch 并替换 ~/.local/bin/collie）".dimmed());
+            println!("    curl -fsSL {url} | sh");
+            println!(
+                "  {}",
+                "或：collie upgrade --run（脚本会探测 OS/arch 并替换 ~/.local/bin/collie）"
+                    .dimmed()
+            );
         }
     } else {
         println!("\n{} 已是最新版本。", "✓".green());
@@ -1430,6 +1565,8 @@ fn cmd_review(
     repo: Option<String>,
     no_wait: bool,
     diff_from_stdin: bool,
+    format: OutputFormat,
+    out: Option<PathBuf>,
 ) -> Result<()> {
     let p = load_profile()?;
     let (base, head, diff) = if diff_from_stdin {
@@ -1448,12 +1585,10 @@ fn cmd_review(
             .or_else(infer_base)
             .ok_or_else(|| anyhow!("无法推断 base 分支，请显式 --base"))?;
         let head = head.unwrap_or_else(infer_head);
-        let d = run_git(&["diff", &format!("{}..{}", base, head)])?;
+        let d = run_git(&["diff", &format!("{base}..{head}")])?;
         if d.trim().is_empty() {
             bail!(
-                "`git diff {}..{}` 没有差异——如果你确实想审查无差异的状态，可以 --diff-from-stdin",
-                base,
-                head
+                "`git diff {base}..{head}` 没有差异——如果你确实想审查无差异的状态，可以 --diff-from-stdin"
             );
         }
         (base, head, d)
@@ -1485,7 +1620,8 @@ fn cmd_review(
         repo_name.dimmed()
     );
 
-    let s: SubmitData = call_json(req(&p, Method::POST, "/api/v1/cli/review/submit").json(&payload))?;
+    let s: SubmitData =
+        call_json(req(&p, Method::POST, "/api/v1/cli/review/submit").json(&payload))?;
     println!(
         "{} taskId={} taskNo={} status={}",
         "✓ accepted".green(),
@@ -1496,9 +1632,25 @@ fn cmd_review(
 
     if no_wait {
         println!("  {}", format!("collie status {}", s.task_id).dimmed());
+        if let Some(path) = out {
+            write_report(
+                &path,
+                format,
+                &StatusData {
+                    task_id: s.task_id,
+                    task_no: Some(s.task_no),
+                    status: Some(s.status),
+                    ..Default::default()
+                },
+            )?;
+        }
         return Ok(());
     }
-    wait_and_print(&p, s.task_id)
+    let status = wait_and_print(&p, s.task_id)?;
+    if let Some(path) = out {
+        write_report(&path, format, &status)?;
+    }
+    Ok(())
 }
 
 fn cmd_review_branch(repo: String, branch: String, no_wait: bool) -> Result<()> {
@@ -1513,7 +1665,10 @@ fn cmd_review_branch(repo: String, branch: String, no_wait: bool) -> Result<()> 
             anyhow!(
                 "找不到名为 {} 的仓库；可用：{}",
                 repo,
-                list.iter().filter_map(|r| r.repo_name.as_deref()).collect::<Vec<_>>().join(", ")
+                list.iter()
+                    .filter_map(|r| r.repo_name.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         })?;
 
@@ -1531,20 +1686,28 @@ fn cmd_review_branch(repo: String, branch: String, no_wait: bool) -> Result<()> 
     let resp: Value = call_json(req(&p, Method::POST, "/api/v1/cli/review/branch").json(&payload))?;
     let task_id = resp.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let task_no = resp.get("taskNo").and_then(|v| v.as_str()).unwrap_or("");
-    println!("{} taskId={} taskNo={}", "✓ accepted".green(), task_id, task_no);
+    println!(
+        "{} taskId={} taskNo={}",
+        "✓ accepted".green(),
+        task_id,
+        task_no
+    );
     if no_wait {
         return Ok(());
     }
-    wait_and_print(&p, task_id)
+    wait_and_print(&p, task_id).map(|_| ())
 }
 
-fn wait_and_print(p: &Profile, task_id: i64) -> Result<()> {
+fn wait_and_print(p: &Profile, task_id: i64) -> Result<StatusData> {
     println!("\n{}", "▸ polling for completion …".bold());
     let mut last = String::new();
     for attempt in 1..=POLL_MAX_ATTEMPTS {
         sleep(Duration::from_secs(POLL_INTERVAL_SECS));
-        let s: StatusData =
-            call_json(req(p, Method::GET, &format!("/api/v1/cli/review/status/{}", task_id)))?;
+        let s: StatusData = call_json(req(
+            p,
+            Method::GET,
+            &format!("/api/v1/cli/review/status/{task_id}"),
+        ))?;
         let cur = s.status.clone().unwrap_or_default();
         if cur != last {
             println!("  [{:>2}] status = {}", attempt, status_color(&cur));
@@ -1558,7 +1721,7 @@ fn wait_and_print(p: &Profile, task_id: i64) -> Result<()> {
             if matches!(cur.as_str(), "failed" | "error" | "blocked") {
                 std::process::exit(2);
             }
-            return Ok(());
+            return Ok(s);
         }
     }
     bail!(
@@ -1568,18 +1731,77 @@ fn wait_and_print(p: &Profile, task_id: i64) -> Result<()> {
     );
 }
 
+fn write_report(path: &PathBuf, format: OutputFormat, status: &StatusData) -> Result<()> {
+    let content = render_report(format, status)?;
+    fs::write(path, content).with_context(|| format!("写入报告失败: {}", path.display()))?;
+    println!("{} report written: {}", "✓".green(), path.display());
+    Ok(())
+}
+
+fn render_report(format: OutputFormat, status: &StatusData) -> Result<String> {
+    match format {
+        OutputFormat::Text => Ok(format!(
+            "Task #{} {}\nstatus: {}\nrisk: {}\nscore: {}\n\n{}\n",
+            status.task_id,
+            status.task_no.as_deref().unwrap_or(""),
+            status.status.as_deref().unwrap_or("-"),
+            status.risk_level.as_deref().unwrap_or("-"),
+            status
+                .score
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status.review_summary.as_deref().unwrap_or("")
+        )),
+        OutputFormat::Md => Ok(format!(
+            "# BorderCollie Review #{}\n\n- Task: `{}`\n- Status: `{}`\n- Risk: `{}`\n- Score: `{}`\n\n{}\n",
+            status.task_id,
+            status.task_no.as_deref().unwrap_or("-"),
+            status.status.as_deref().unwrap_or("-"),
+            status.risk_level.as_deref().unwrap_or("-"),
+            status
+                .score
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status.review_summary.as_deref().unwrap_or("_No summary returned._")
+        )),
+        OutputFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "taskId": status.task_id,
+            "taskNo": status.task_no,
+            "status": status.status,
+            "riskLevel": status.risk_level,
+            "score": status.score,
+            "summary": status.review_summary,
+            "error": status.error_msg,
+        }))
+        .context("序列化报告失败"),
+    }
+}
+
 fn cmd_status(id: i64) -> Result<()> {
     let p = load_profile()?;
-    let s: StatusData = call_json(req(&p, Method::GET, &format!("/api/v1/cli/review/status/{}", id)))?;
+    let s: StatusData = call_json(req(
+        &p,
+        Method::GET,
+        &format!("/api/v1/cli/review/status/{id}"),
+    ))?;
     print_status(&s);
     Ok(())
 }
 
 fn cmd_result(id: i64) -> Result<()> {
     let p = load_profile()?;
-    let r: ResultData = call_json(req(&p, Method::GET, &format!("/api/v1/cli/review/result/{}", id)))?;
+    let r: ResultData = call_json(req(
+        &p,
+        Method::GET,
+        &format!("/api/v1/cli/review/result/{id}"),
+    ))?;
     println!();
-    println!("{} #{} {}", "Task".bold(), r.task_id, r.task_no.as_deref().unwrap_or("").dimmed());
+    println!(
+        "{} #{} {}",
+        "Task".bold(),
+        r.task_id,
+        r.task_no.as_deref().unwrap_or("").dimmed()
+    );
     println!("  repo       : {}", r.repo_name.as_deref().unwrap_or("-"));
     if r.source_branch.is_some() || r.target_branch.is_some() {
         println!(
@@ -1592,17 +1814,20 @@ fn cmd_result(id: i64) -> Result<()> {
         println!("  commit     : {}", commit.dimmed());
     }
     if let Some(author) = &r.author {
-        println!("  author     : {}", author);
+        println!("  author     : {author}");
     }
-    println!("  status     : {}", status_color(r.status.as_deref().unwrap_or("?")));
+    println!(
+        "  status     : {}",
+        status_color(r.status.as_deref().unwrap_or("?"))
+    );
     if let Some(g) = &r.gate_status {
-        println!("  gate       : {}", g);
+        println!("  gate       : {g}");
     }
     if let Some(rl) = &r.risk_level {
         println!("  risk       : {}", risk_color(rl));
     }
     if let Some(score) = r.score {
-        println!("  score      : {}", score);
+        println!("  score      : {score}");
     }
     if r.additions.is_some() || r.deletions.is_some() {
         println!(
@@ -1614,7 +1839,10 @@ fn cmd_result(id: i64) -> Result<()> {
         );
     }
     println!("  created at : {}", r.created_at.as_deref().unwrap_or("-"));
-    println!("  finished at: {}", r.completed_at.as_deref().unwrap_or("-"));
+    println!(
+        "  finished at: {}",
+        r.completed_at.as_deref().unwrap_or("-")
+    );
     if let Some(err) = r.error_msg.as_deref().filter(|s| !s.is_empty()) {
         println!("\n{}\n{}", "× error".red().bold(), err);
     }
@@ -1626,8 +1854,11 @@ fn cmd_result(id: i64) -> Result<()> {
         ("license findings", r.license_findings),
         ("SAST findings", r.sast_findings),
     ] {
-        if let Some(v) = val.as_deref().filter(|s| !s.is_empty() && *s != "[]" && *s != "{}") {
-            println!("\n{}\n{}", format!("▸ {}", label).bold(), v);
+        if let Some(v) = val
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "[]" && *s != "{}")
+        {
+            println!("\n{}\n{}", format!("▸ {label}").bold(), v);
         }
     }
     if let Some(detail) = r.review_detail.as_deref().filter(|s| !s.is_empty()) {
@@ -1639,19 +1870,19 @@ fn cmd_result(id: i64) -> Result<()> {
 
 fn cmd_list(page: u64, size: u64, status: Option<String>) -> Result<()> {
     let p = load_profile()?;
-    let mut path = format!("/api/v1/cli/review/list?current={}&size={}", page, size);
+    let mut filters: Vec<(&str, String)> = Vec::new();
     if let Some(s) = status {
-        use std::fmt::Write;
-        let _ = write!(path, "&status={}", urlencoding::encode(&s));
+        filters.push(("status", s));
     }
+    let path = page_path("/api/v1/cli/review/list", page, size, &filters);
     let page_data: Page<TaskRow> = call_json(req(&p, Method::GET, &path))?;
     if page_data.records.is_empty() {
         println!("{}", "(no tasks)".dimmed());
         return Ok(());
     }
     println!(
-        "{:>7}  {:<22}  {:<24}  {:<10}  {:<8}  {:<5}  {}",
-        "ID", "TASK_NO", "REPO", "STATUS", "RISK", "SCORE", "CREATED"
+        "{:>7}  {:<22}  {:<24}  {:<10}  {:<8}  {:<5}  CREATED",
+        "ID", "TASK_NO", "REPO", "STATUS", "RISK", "SCORE"
     );
     for row in &page_data.records {
         let st = row.status.as_deref().unwrap_or("-");
@@ -1663,7 +1894,9 @@ fn cmd_list(page: u64, size: u64, status: Option<String>) -> Result<()> {
             row.repo_name.as_deref().unwrap_or("-"),
             status_color(st),
             risk_color(rl),
-            row.score.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+            row.score
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             row.created_at.as_deref().unwrap_or("-").dimmed(),
         );
     }
@@ -1680,9 +1913,22 @@ fn cmd_list(page: u64, size: u64, status: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn page_path(base: &str, page: u64, size: u64, filters: &[(&str, String)]) -> String {
+    let mut path = format!("{base}?current={page}&size={size}");
+    for (key, value) in filters {
+        use std::fmt::Write;
+        let _ = write!(path, "&{key}={}", urlencoding::encode(value));
+    }
+    path
+}
+
 fn cmd_retry(id: i64) -> Result<()> {
     let p = load_profile()?;
-    call_unit(req(&p, Method::POST, &format!("/api/v1/cli/review/{}/retry", id)))?;
+    call_unit(req(
+        &p,
+        Method::POST,
+        &format!("/api/v1/cli/review/{id}/retry"),
+    ))?;
     println!("{} task #{} re-queued", "✓".green(), id);
     Ok(())
 }
@@ -1697,7 +1943,7 @@ mod urlencoding {
                 _ => {
                     let mut buf = [0u8; 4];
                     for b in c.encode_utf8(&mut buf).as_bytes() {
-                        out.push_str(&format!("%{:02X}", b));
+                        out.push_str(&format!("%{b:02X}"));
                     }
                 }
             }
@@ -1716,17 +1962,27 @@ fn main() {
         Cmd::Whoami => cmd_whoami(),
         Cmd::Repo { sub } => match sub {
             RepoCmd::List => cmd_repo_list(),
-            RepoCmd::Add { name, url, platform, token, webhook_secret, model_id } => {
-                cmd_repo_add(name, url, platform, token, webhook_secret, model_id)
-            }
+            RepoCmd::Add {
+                name,
+                url,
+                platform,
+                token,
+                webhook_secret,
+                model_id,
+            } => cmd_repo_add(name, url, platform, token, webhook_secret, model_id),
             RepoCmd::Rm { id } => cmd_repo_rm(id),
             RepoCmd::Toggle { id } => cmd_repo_toggle(id),
         },
         Cmd::Model { sub } => match sub {
             ModelCmd::List => cmd_model_list(),
-            ModelCmd::Add { name, provider, api_url, api_key, max_tokens, temperature } => {
-                cmd_model_add(name, provider, api_url, api_key, max_tokens, temperature)
-            }
+            ModelCmd::Add {
+                name,
+                provider,
+                api_url,
+                api_key,
+                max_tokens,
+                temperature,
+            } => cmd_model_add(name, provider, api_url, api_key, max_tokens, temperature),
             ModelCmd::Rm { id } => cmd_model_rm(id),
             ModelCmd::Use { id } => cmd_model_use(id),
             ModelCmd::Show { id } => cmd_model_show(id),
@@ -1762,25 +2018,55 @@ fn main() {
                 system_prompt,
                 system_prompt_file,
                 model_id,
-            } => cmd_reviewer_add(name, category, language_tags, system_prompt, system_prompt_file, model_id),
+            } => cmd_reviewer_add(
+                name,
+                category,
+                language_tags,
+                system_prompt,
+                system_prompt_file,
+                model_id,
+            ),
             ReviewerCmd::Rm { id } => cmd_reviewer_rm(id),
         },
-        Cmd::Login { api, non_interactive, key } => cmd_login(api, non_interactive, key),
+        Cmd::Login {
+            api,
+            non_interactive,
+            key,
+        } => cmd_login(api, non_interactive, key),
         Cmd::Logout => cmd_logout(),
-        Cmd::Review { base, head, repo, no_wait, diff_from_stdin } => {
-            cmd_review(base, head, repo, no_wait, diff_from_stdin)
-        }
-        Cmd::ReviewBranch { repo, branch, no_wait } => cmd_review_branch(repo, branch, no_wait),
+        Cmd::Review {
+            base,
+            head,
+            repo,
+            no_wait,
+            diff_from_stdin,
+            format,
+            out,
+        } => cmd_review(base, head, repo, no_wait, diff_from_stdin, format, out),
+        Cmd::ReviewBranch {
+            repo,
+            branch,
+            no_wait,
+        } => cmd_review_branch(repo, branch, no_wait),
         Cmd::Status { id } => cmd_status(id),
         Cmd::Result { id } => cmd_result(id),
         Cmd::List { page, size, status } => cmd_list(page, size, status),
         Cmd::Retry { id } => cmd_retry(id),
         Cmd::Usage => cmd_usage(),
         Cmd::Plans => cmd_plans(),
-        Cmd::Logs { task_id, page, size, status } => cmd_logs(task_id, page, size, status),
+        Cmd::Logs {
+            task_id,
+            page,
+            size,
+            status,
+        } => cmd_logs(task_id, page, size, status),
         Cmd::Config => cmd_config(),
         Cmd::Completion { shell } => cmd_completion(shell),
-        Cmd::Upgrade { check, run, install_url } => cmd_upgrade(check, run, install_url),
+        Cmd::Upgrade {
+            check,
+            run,
+            install_url,
+        } => cmd_upgrade(check, run, install_url),
     };
     if let Err(err) = res {
         eprintln!("{} {:#}", "✗".red().bold(), err);

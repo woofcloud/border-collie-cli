@@ -1,10 +1,10 @@
 [package]
 name = "collie"
-version = "2.0.0"
+version = "1.9.0"
 edition = "2021"
 description = "BorderCollie CLI — submit local diffs for AI review from any terminal or CI"
 license = "Apache-2.0"
-repository = "https://github.com/woofcloud/border-collie"
+repository = "https://github.com/woofcloud/border-collie-cli"
 
 [[bin]]
 name = "collie"
